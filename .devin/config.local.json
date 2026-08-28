@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(dir)",
+      "Exec(pnpm create)",
+      "Exec(npm)",
+      "Exec(npx tailwindcss)",
+      "Exec(mkdir src)",
+      "Exec(npx convex)"
+    ]
+  }
+}
