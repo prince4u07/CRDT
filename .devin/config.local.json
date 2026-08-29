@@ -6,7 +6,10 @@
       "Exec(npm)",
       "Exec(npx tailwindcss)",
       "Exec(mkdir src)",
-      "Exec(npx convex)"
+      "Exec(npx convex)",
+      "Exec(ls)",
+      "Exec(mkdir)",
+      "Exec(mv)"
     ]
   }
 }

@@ -118,7 +118,7 @@ class CRDTService {
     const requests = doc.getArray('requests');
     
     let found = false;
-    requests.forEach((requestMap, index) => {
+    requests.forEach((requestMap) => {
       if (requestMap.get('id') === requestId) {
         Object.keys(updates).forEach(key => {
           // Stringify headers for consistent storage

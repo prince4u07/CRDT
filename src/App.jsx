@@ -1,4 +1,6 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
+import { useMutation, useQuery } from 'convex/react'
+import { api } from '../convex/_generated'
 import { crdtService } from './lib/crdtService'
 
 function App() {
@@ -6,6 +8,12 @@ function App() {
   const [selectedRequest, setSelectedRequest] = useState(null)
   const [connectionStatus, setConnectionStatus] = useState('disconnected')
   const [collectionId] = useState('demo-collection')
+  const [convexCollectionId, setConvexCollectionId] = useState(null)
+
+  // Convex mutations and queries
+  const createCollection = useMutation(api.collections.createCollection)
+  const updateCRDTDocument = useMutation(api.collections.updateCRDTDocument)
+  const collections = useQuery(api.collections.listCollections)
 
   useEffect(() => {
     // Initialize CRDT document and sync
@@ -22,11 +30,12 @@ function App() {
       setRequests(data.requests)
     })
     
-    // Load initial data
-    setRequests(crdtService.getRequests(collectionId))
+    // Load initial data (cached to avoid multiple calls)
+    const initialRequests = crdtService.getRequests(collectionId)
+    setRequests(initialRequests)
     
     // Add sample data if empty
-    if (crdtService.getRequests(collectionId).length === 0) {
+    if (initialRequests.length === 0) {
       crdtService.addRequest(collectionId, {
         name: 'Get Users',
         method: 'GET',
@@ -45,9 +54,70 @@ function App() {
       unsubscribe()
       crdtService.destroy(collectionId)
     }
-  }, [collectionId])
+  }, [collectionId, convexCollectionId, createCollection, updateCRDTDocument, collections])
 
-  const handleAddRequest = () => {
+  useEffect(() => {
+    // Initialize Convex collection when collections are loaded
+    initializeConvexCollection()
+  }, [collections, convexCollectionId, createCollection])
+
+  // Sync to Convex when requests change (debounced)
+  useEffect(() => {
+    if (!convexCollectionId || requests.length === 0) return
+    
+    const timeoutId = setTimeout(() => {
+      syncToConvex({ requests, metadata: crdtService.getMetadata(collectionId) })
+    }, 1000) // Debounce sync to avoid too frequent updates
+    
+    return () => clearTimeout(timeoutId)
+  }, [requests, convexCollectionId, collectionId, syncToConvex])
+
+  const initializeConvexCollection = useCallback(async () => {
+    try {
+      // Check if we already have a collection ID stored
+      if (!convexCollectionId && collections && collections.length > 0) {
+        // Use existing collection or create new one
+        const existingCollection = collections.find(c => c.name === 'demo-collection')
+        if (existingCollection) {
+          setConvexCollectionId(existingCollection._id)
+        } else {
+          const newId = await createCollection({
+            name: 'demo-collection',
+            description: 'Demo API collection for CRDT testing'
+          })
+          setConvexCollectionId(newId)
+        }
+      }
+    } catch (error) {
+      console.error('Failed to initialize Convex collection:', error)
+    }
+  }, [convexCollectionId, collections, createCollection])
+
+  const syncToConvex = useCallback(async (data) => {
+    if (!convexCollectionId) return
+    
+    try {
+      const documentState = crdtService.exportDocument(collectionId)
+      // Convert Uint8Array to base64 for browser compatibility
+      let binary = ''
+      const bytes = new Uint8Array(documentState)
+      const len = bytes.byteLength
+      for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i])
+      }
+      const base64State = btoa(binary)
+      
+      await updateCRDTDocument({
+        id: convexCollectionId,
+        crdtDocument: base64State,
+        version: data.metadata?.version || 1
+      })
+    } catch (error) {
+      console.error('Failed to sync to Convex:', error)
+    }
+  }, [convexCollectionId, collectionId, updateCRDTDocument])
+
+  const handleAddRequest = useCallback(() => {
     const newRequest = {
       name: 'New Request',
       method: 'GET',
@@ -57,26 +127,37 @@ function App() {
     }
     const id = crdtService.addRequest(collectionId, newRequest)
     setSelectedRequest(id)
-  }
+  }, [collectionId])
 
-  const handleSelectRequest = (request) => {
+  const handleSelectRequest = useCallback((request) => {
     setSelectedRequest(request.id)
-  }
+  }, [])
 
-  const handleUpdateRequest = (updates) => {
+  const handleUpdateRequest = useCallback((updates) => {
     if (selectedRequest) {
-      crdtService.updateRequest(collectionId, selectedRequest, updates)
+      try {
+        crdtService.updateRequest(collectionId, selectedRequest, updates)
+      } catch (error) {
+        console.error('Failed to update request:', error)
+      }
     }
-  }
+  }, [collectionId, selectedRequest])
 
-  const handleDeleteRequest = () => {
+  const handleDeleteRequest = useCallback(() => {
     if (selectedRequest) {
-      crdtService.deleteRequest(collectionId, selectedRequest)
-      setSelectedRequest(null)
+      try {
+        crdtService.deleteRequest(collectionId, selectedRequest)
+        setSelectedRequest(null)
+      } catch (error) {
+        console.error('Failed to delete request:', error)
+      }
     }
-  }
+  }, [collectionId, selectedRequest])
 
-  const selectedRequestData = requests.find(r => r.id === selectedRequest)
+  const selectedRequestData = useMemo(() => 
+    requests.find(r => r.id === selectedRequest), 
+    [requests, selectedRequest]
+  )
 
   return (
     <div className="min-h-screen bg-black text-white p-8">
@@ -151,8 +232,15 @@ function App() {
                     <input 
                       type="text" 
                       value={selectedRequestData.url}
-                      onChange={(e) => handleUpdateRequest({ url: e.target.value })}
+                      onChange={(e) => {
+                        const url = e.target.value
+                        // Basic URL validation to prevent javascript: and other dangerous protocols
+                        if (!url.trim() || url.startsWith('http://') || url.startsWith('https://')) {
+                          handleUpdateRequest({ url })
+                        }
+                      }}
                       className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
+                      placeholder="https://api.example.com/endpoint"
                     />
                   </div>
                 </div>
@@ -163,14 +251,26 @@ function App() {
                       ? selectedRequestData.headers 
                       : JSON.stringify(selectedRequestData.headers || {}, null, 2)}
                     onChange={(e) => {
+                      const value = e.target.value
                       try {
-                        const headers = JSON.parse(e.target.value)
-                        handleUpdateRequest({ headers })
+                        // Basic JSON validation to prevent injection
+                        if (value.trim() && (value.includes('{') || value.includes('['))) {
+                          const headers = JSON.parse(value)
+                          // Validate that headers is an object
+                          if (typeof headers === 'object' && headers !== null && !Array.isArray(headers)) {
+                            handleUpdateRequest({ headers })
+                          } else {
+                            handleUpdateRequest({ headers: value })
+                          }
+                        } else {
+                          handleUpdateRequest({ headers: value })
+                        }
                       } catch {
-                        handleUpdateRequest({ headers: e.target.value })
+                        handleUpdateRequest({ headers: value })
                       }
                     }}
                     className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white h-24 font-mono text-sm"
+                    placeholder="Enter headers as JSON format"
                   />
                 </div>
                 <div>

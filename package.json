@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "server": "node server.js"
+    "server": "node server.js",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "lint": "eslint src/**/*.{js,jsx}"
   },
   "keywords": [],
   "author": "",
@@ -25,7 +29,14 @@
     "yjs": "^13.6.32"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
     "@tailwindcss/postcss": "^4.3.3",
-    "postcss": "^8.5.26"
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.6",
+    "eslint": "^9.39.5",
+    "jsdom": "^29.1.1",
+    "postcss": "^8.5.26",
+    "vitest": "^4.1.11"
   }
 }
