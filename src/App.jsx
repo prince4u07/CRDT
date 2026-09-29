@@ -1,318 +1,372 @@
-import { useState, useEffect, useCallback, useMemo } from 'react'
-import { useMutation, useQuery } from 'convex/react'
-import { api } from '../convex/_generated'
-import { crdtService } from './lib/crdtService'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { crdtService, colorForName } from './lib/crdtService'
+import { isConvexConfigured, convexService } from './lib/convexService'
+import { sendRequest } from './lib/httpClient'
+import RequestList from './components/RequestList'
+import RequestEditor from './components/RequestEditor'
+import ResponseViewer from './components/ResponseViewer'
+import PresenceBar from './components/PresenceBar'
+
+const COLLECTION_SLUG = 'demo-collection'
+const IDENTITY_KEY = 'crdt.identity'
+const SNAPSHOT_DEBOUNCE_MS = 2000
+const FIRST_SYNC_WAIT_MS = 3000
+
+const SAMPLE_REQUEST = {
+  name: 'Get Users',
+  method: 'GET',
+  url: 'https://api.example.com/users',
+  headers: { 'Content-Type': 'application/json' },
+  body: '',
+}
+
+const loadIdentity = () => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(IDENTITY_KEY) || 'null')
+    if (stored?.name) return { name: stored.name, color: stored.color || colorForName(stored.name) }
+  } catch {
+    // A corrupt entry should never stop the app from loading.
+  }
+  return null
+}
+
+const saveIdentity = (identity) => {
+  try {
+    localStorage.setItem(IDENTITY_KEY, JSON.stringify(identity))
+  } catch {
+    // Private browsing modes can reject writes; identity is not critical.
+  }
+}
 
 function App() {
   const [requests, setRequests] = useState([])
-  const [selectedRequest, setSelectedRequest] = useState(null)
-  const [connectionStatus, setConnectionStatus] = useState('disconnected')
-  const [collectionId] = useState('demo-collection')
-  const [convexCollectionId, setConvexCollectionId] = useState(null)
+  const [selectedId, setSelectedId] = useState(null)
+  const [peers, setPeers] = useState([])
+  const [status, setStatus] = useState('connecting')
+  const [synced, setSynced] = useState(false)
+  const [canUndo, setCanUndo] = useState(false)
+  const [canRedo, setCanRedo] = useState(false)
+  const [response, setResponse] = useState(null)
+  const [sending, setSending] = useState(false)
+  const [notice, setNotice] = useState(null)
+  const [identity, setIdentity] = useState(() => loadIdentity() || { name: 'Anonymous', color: '#38bdf8' })
 
-  // Convex mutations and queries
-  const createCollection = useMutation(api.collections.createCollection)
-  const updateCRDTDocument = useMutation(api.collections.updateCRDTDocument)
-  const collections = useQuery(api.collections.listCollections)
+  const sendingRef = useRef(null)
+  const bootstrappedRef = useRef(false)
+  const [reloadToken, setReloadToken] = useState(0)
+  // The setup effect must not re-run when the display name changes, so the
+  // initial identity is read from a ref instead of the state.
+  const identityRef = useRef(identity)
 
-  useEffect(() => {
-    // Initialize CRDT document and sync
-    const doc = crdtService.getOrCreateDocument(collectionId)
-    
-    // Set up WebSocket sync
-    const provider = crdtService.setupWebSocketSync(collectionId, doc)
-    
-    // Set up offline persistence
-    crdtService.setupOfflinePersistence(collectionId, doc)
-    
-    // Subscribe to changes
-    const unsubscribe = crdtService.subscribe(collectionId, (data) => {
-      setRequests(data.requests)
-    })
-    
-    // Load initial data (cached to avoid multiple calls)
-    const initialRequests = crdtService.getRequests(collectionId)
-    setRequests(initialRequests)
-    
-    // Add sample data if empty
-    if (initialRequests.length === 0) {
-      crdtService.addRequest(collectionId, {
-        name: 'Get Users',
-        method: 'GET',
-        url: 'https://api.example.com/users',
-        headers: { 'Content-Type': 'application/json' },
-        body: ''
-      })
-    }
-    
-    // Monitor connection status
-    provider.on('status', (event) => {
-      setConnectionStatus(event.status)
-    })
-    
-    return () => {
-      unsubscribe()
-      crdtService.destroy(collectionId)
-    }
-  }, [collectionId, convexCollectionId, createCollection, updateCRDTDocument, collections])
+  // ---------------------------------------------------------------- handlers
+  // All callbacks are declared before the effects that depend on them, so
+  // there is no temporal-dead-zone access while rendering.
 
-  useEffect(() => {
-    // Initialize Convex collection when collections are loaded
-    initializeConvexCollection()
-  }, [collections, convexCollectionId, createCollection])
-
-  // Sync to Convex when requests change (debounced)
-  useEffect(() => {
-    if (!convexCollectionId || requests.length === 0) return
-    
-    const timeoutId = setTimeout(() => {
-      syncToConvex({ requests, metadata: crdtService.getMetadata(collectionId) })
-    }, 1000) // Debounce sync to avoid too frequent updates
-    
-    return () => clearTimeout(timeoutId)
-  }, [requests, convexCollectionId, collectionId, syncToConvex])
-
-  const initializeConvexCollection = useCallback(async () => {
-    try {
-      // Check if we already have a collection ID stored
-      if (!convexCollectionId && collections && collections.length > 0) {
-        // Use existing collection or create new one
-        const existingCollection = collections.find(c => c.name === 'demo-collection')
-        if (existingCollection) {
-          setConvexCollectionId(existingCollection._id)
-        } else {
-          const newId = await createCollection({
-            name: 'demo-collection',
-            description: 'Demo API collection for CRDT testing'
-          })
-          setConvexCollectionId(newId)
-        }
-      }
-    } catch (error) {
-      console.error('Failed to initialize Convex collection:', error)
-    }
-  }, [convexCollectionId, collections, createCollection])
-
-  const syncToConvex = useCallback(async (data) => {
-    if (!convexCollectionId) return
-    
-    try {
-      const documentState = crdtService.exportDocument(collectionId)
-      // Convert Uint8Array to base64 for browser compatibility
-      let binary = ''
-      const bytes = new Uint8Array(documentState)
-      const len = bytes.byteLength
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i])
-      }
-      const base64State = btoa(binary)
-      
-      await updateCRDTDocument({
-        id: convexCollectionId,
-        crdtDocument: base64State,
-        version: data.metadata?.version || 1
-      })
-    } catch (error) {
-      console.error('Failed to sync to Convex:', error)
-    }
-  }, [convexCollectionId, collectionId, updateCRDTDocument])
+  const applyPatch = useCallback((patch) => {
+    if (!selectedId) return
+    crdtService.updateRequest(COLLECTION_SLUG, selectedId, patch)
+  }, [selectedId])
 
   const handleAddRequest = useCallback(() => {
-    const newRequest = {
-      name: 'New Request',
-      method: 'GET',
-      url: '',
-      headers: {},
-      body: ''
-    }
-    const id = crdtService.addRequest(collectionId, newRequest)
-    setSelectedRequest(id)
-  }, [collectionId])
-
-  const handleSelectRequest = useCallback((request) => {
-    setSelectedRequest(request.id)
+    const id = crdtService.addRequest(COLLECTION_SLUG, { name: 'New Request' })
+    setSelectedId(id)
+    setResponse(null)
   }, [])
 
-  const handleUpdateRequest = useCallback((updates) => {
-    if (selectedRequest) {
-      try {
-        crdtService.updateRequest(collectionId, selectedRequest, updates)
-      } catch (error) {
-        console.error('Failed to update request:', error)
-      }
-    }
-  }, [collectionId, selectedRequest])
+  const handleSelectRequest = useCallback((id) => {
+    setSelectedId(id)
+    setResponse(null)
+  }, [])
 
   const handleDeleteRequest = useCallback(() => {
-    if (selectedRequest) {
-      try {
-        crdtService.deleteRequest(collectionId, selectedRequest)
-        setSelectedRequest(null)
-      } catch (error) {
-        console.error('Failed to delete request:', error)
+    if (!selectedId) return
+    if (crdtService.deleteRequest(COLLECTION_SLUG, selectedId)) {
+      setSelectedId(null)
+      setResponse(null)
+    }
+  }, [selectedId])
+
+  const handleDuplicateRequest = useCallback(() => {
+    if (!selectedId) return
+    const id = crdtService.duplicateRequest(COLLECTION_SLUG, selectedId)
+    if (id) setSelectedId(id)
+  }, [selectedId])
+
+  const handleSend = useCallback(async () => {
+    const request = selectedId ? crdtService.getRequest(COLLECTION_SLUG, selectedId) : null
+    if (!request) return
+
+    sendingRef.current?.abort()
+    const controller = new AbortController()
+    sendingRef.current = controller
+    setSending(true)
+    setResponse(null)
+
+    const result = await sendRequest({
+      method: request.method,
+      url: request.url,
+      headers: request.headers,
+      body: request.body,
+      signal: controller.signal,
+    })
+
+    if (!controller.signal.aborted) {
+      setResponse(result)
+      setSending(false)
+      sendingRef.current = null
+    }
+  }, [selectedId])
+
+  const handleUndo = useCallback(() => {
+    crdtService.undo(COLLECTION_SLUG)
+  }, [])
+
+  const handleRedo = useCallback(() => {
+    crdtService.redo(COLLECTION_SLUG)
+  }, [])
+
+  const handleRename = useCallback((name) => {
+    const trimmed = name.trim()
+    if (!trimmed) {
+      setIdentity(identityRef.current)
+      return
+    }
+    const next = { ...identityRef.current, name: trimmed, color: colorForName(trimmed) }
+    identityRef.current = next
+    setIdentity(next)
+    saveIdentity(next)
+    crdtService.setLocalUser(COLLECTION_SLUG, next)
+  }, [])
+
+  const handleClearCache = useCallback(async () => {
+    if (!window.confirm('Clear the local offline copy of this collection? Changes synced to the server are kept.')) return
+    try {
+      await crdtService.clearLocalCache(COLLECTION_SLUG)
+      // Re-open the collection so a fresh (empty) offline cache is attached;
+      // otherwise later edits would no longer be cached. Bootstrapping runs
+      // again so the re-opened document can refill itself if the server is
+      // unreachable.
+      bootstrappedRef.current = false
+      setReloadToken((token) => token + 1)
+      setNotice({ tone: 'info', text: 'Local offline cache cleared.' })
+    } catch (error) {
+      setNotice({ tone: 'error', text: `Could not clear the cache: ${error.message}` })
+    }
+  }, [])
+
+  const refreshUndoState = useCallback(() => {
+    setCanUndo(crdtService.canUndo(COLLECTION_SLUG))
+    setCanRedo(crdtService.canRedo(COLLECTION_SLUG))
+  }, [])
+
+  // ------------------------------------------------------------------- setup
+  useEffect(() => {
+    let active = true
+    let cleanup = () => {}
+    bootstrappedRef.current = false
+
+    // One effect owns the whole lifecycle: document + IndexedDB + WebSocket +
+    // presence, and tears all of it down again on unmount.
+    const setup = async () => {
+      await crdtService.initCollection(COLLECTION_SLUG, { user: identityRef.current })
+      if (!active) return
+
+      const unsubscribeStatus = crdtService.onStatusChange(COLLECTION_SLUG, (next) => {
+        setStatus(next.status)
+        setSynced(next.synced)
+      })
+      const unsubscribePresence = crdtService.onPresenceChange(COLLECTION_SLUG, setPeers)
+      const unsubscribeDoc = crdtService.subscribe(COLLECTION_SLUG, (data) => {
+        setRequests(data.requests)
+        refreshUndoState()
+      })
+
+      // Seed a brand new collection with a sample request, and restore one from
+      // the Convex snapshot when the browser brings nothing of its own. Both
+      // happen only after the first sync, so a stored snapshot can never be
+      // merged on top of live state (which would resurrect deleted requests).
+      if (!bootstrappedRef.current) {
+        bootstrappedRef.current = true
+        await crdtService.waitForInitialSync(COLLECTION_SLUG, FIRST_SYNC_WAIT_MS)
+        if (!active) return
+
+        if (crdtService.getRequests(COLLECTION_SLUG).length === 0) {
+          if (isConvexConfigured) {
+            try {
+              const snapshot = await convexService.loadSnapshot(COLLECTION_SLUG)
+              if (snapshot) {
+                crdtService.importDocument(COLLECTION_SLUG, snapshot)
+                setNotice({ tone: 'info', text: 'Restored this collection from the Convex snapshot.' })
+              }
+            } catch (error) {
+              console.warn('[app] could not load the Convex snapshot:', error)
+            }
+          }
+
+          if (active && crdtService.getRequests(COLLECTION_SLUG).length === 0) {
+            crdtService.addRequest(COLLECTION_SLUG, SAMPLE_REQUEST)
+          }
+        }
+      }
+
+      if (!active) return
+      cleanup = () => {
+        unsubscribeStatus()
+        unsubscribePresence()
+        unsubscribeDoc()
       }
     }
-  }, [collectionId, selectedRequest])
 
-  const selectedRequestData = useMemo(() => 
-    requests.find(r => r.id === selectedRequest), 
-    [requests, selectedRequest]
+    setup().catch((error) => {
+      console.error('[app] failed to initialise the collection:', error)
+      setNotice({ tone: 'error', text: `Could not open collection: ${error.message}` })
+    })
+
+    return () => {
+      active = false
+      cleanup()
+      crdtService.destroy(COLLECTION_SLUG)
+    }
+  }, [refreshUndoState, reloadToken])
+
+  // Broadcast the open request so other users can see who is editing what.
+  useEffect(() => {
+    crdtService.setEditing(COLLECTION_SLUG, selectedId)
+  }, [selectedId])
+
+  // Notices are informational; clear them after a few seconds.
+  useEffect(() => {
+    if (!notice) return
+    const timer = setTimeout(() => setNotice(null), 6000)
+    return () => clearTimeout(timer)
+  }, [notice])
+
+  // Undo/redo keyboard shortcuts (ignored while typing in a field, so the
+  // browser's own text undo still works).
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'z') return
+      const target = event.target
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) return
+      event.preventDefault()
+      if (event.shiftKey) crdtService.redo(COLLECTION_SLUG)
+      else crdtService.undo(COLLECTION_SLUG)
+      refreshUndoState()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [refreshUndoState])
+
+  // Push a Yjs snapshot to Convex (debounced) so a new browser can bootstrap.
+  useEffect(() => {
+    if (!isConvexConfigured || requests.length === 0) return
+    const timer = setTimeout(async () => {
+      try {
+        const record = await convexService.ensureCollection(
+          COLLECTION_SLUG,
+          crdtService.getMetadata(COLLECTION_SLUG).name,
+          'Demo API collection for CRDT testing'
+        )
+        await convexService.pushSnapshot(record._id, crdtService.exportDocument(COLLECTION_SLUG))
+      } catch (error) {
+        console.warn('[app] Convex snapshot failed:', error)
+      }
+    }, SNAPSHOT_DEBOUNCE_MS)
+    return () => clearTimeout(timer)
+  }, [requests])
+
+  useEffect(() => () => sendingRef.current?.abort(), [])
+
+  // ------------------------------------------------------------------ render
+  const selectedRequest = useMemo(
+    () => requests.find((request) => request.id === selectedId) || null,
+    [requests, selectedId]
   )
 
   return (
     <div className="min-h-screen bg-black text-white p-8">
       <div className="max-w-6xl mx-auto">
-        <header className="mb-8">
-          <h1 className="text-3xl font-bold mb-2">CRDT Collaborative API Workspace</h1>
-          <p className="text-gray-400">Real-time collaboration with automatic conflict resolution</p>
-        </header>
+        <header className="mb-6 flex flex-wrap items-end justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold mb-2">CRDT Collaborative API Workspace</h1>
+            <p className="text-gray-400">
+              Real-time collaboration with automatic conflict resolution
+            </p>
+          </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          <div className="lg:col-span-1 bg-gray-900 rounded-lg p-4">
-            <h2 className="text-xl font-semibold mb-4">API Requests</h2>
-            <div className="space-y-2">
-              {requests.map((request) => (
-                <div 
-                  key={request.id} 
-                  className={`bg-gray-800 rounded p-3 hover:bg-gray-700 cursor-pointer ${selectedRequest === request.id ? 'ring-2 ring-blue-500' : ''}`}
-                  onClick={() => handleSelectRequest(request)}
-                >
-                  <div className="flex items-center gap-2 mb-1">
-                    <span className={`text-xs font-bold px-2 py-1 rounded ${
-                      request.method === 'GET' ? 'bg-green-600' :
-                      request.method === 'POST' ? 'bg-blue-600' :
-                      request.method === 'PUT' ? 'bg-yellow-600' :
-                      request.method === 'DELETE' ? 'bg-red-600' : 'bg-gray-600'
-                    }`}>
-                      {request.method}
-                    </span>
-                    <span className="text-sm truncate">{request.name}</span>
-                  </div>
-                  <div className="text-xs text-gray-400 truncate">{request.url}</div>
-                </div>
-              ))}
-            </div>
-            <button 
-              onClick={handleAddRequest}
-              className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white py-2 px-4 rounded"
+          <div className="flex items-center gap-2">
+            <label htmlFor="identity" className="text-xs text-gray-400">
+              You are
+            </label>
+            <input
+              id="identity"
+              type="text"
+              value={identity.name}
+              onChange={(event) => setIdentity({ ...identity, name: event.target.value })}
+              onBlur={(event) => handleRename(event.target.value)}
+              onKeyDown={(event) => event.key === 'Enter' && event.currentTarget.blur()}
+              className="bg-gray-800 border border-gray-700 rounded px-3 py-1 text-sm w-40"
+            />
+            <button
+              type="button"
+              onClick={handleClearCache}
+              className="text-xs px-2 py-1 rounded bg-gray-800 hover:bg-gray-700"
+              title="Delete the IndexedDB copy of this collection"
             >
-              + Add Request
+              Clear local cache
             </button>
           </div>
+        </header>
 
-          <div className="lg:col-span-2 bg-gray-900 rounded-lg p-4">
-            <h2 className="text-xl font-semibold mb-4">Request Editor</h2>
-            {selectedRequestData ? (
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium mb-2">Request Name</label>
-                  <input 
-                    type="text" 
-                    value={selectedRequestData.name}
-                    onChange={(e) => handleUpdateRequest({ name: e.target.value })}
-                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                  />
-                </div>
-                <div className="grid grid-cols-4 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium mb-2">Method</label>
-                    <select 
-                      value={selectedRequestData.method}
-                      onChange={(e) => handleUpdateRequest({ method: e.target.value })}
-                      className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                    >
-                      <option>GET</option>
-                      <option>POST</option>
-                      <option>PUT</option>
-                      <option>DELETE</option>
-                    </select>
-                  </div>
-                  <div className="col-span-3">
-                    <label className="block text-sm font-medium mb-2">URL</label>
-                    <input 
-                      type="text" 
-                      value={selectedRequestData.url}
-                      onChange={(e) => {
-                        const url = e.target.value
-                        // Basic URL validation to prevent javascript: and other dangerous protocols
-                        if (!url.trim() || url.startsWith('http://') || url.startsWith('https://')) {
-                          handleUpdateRequest({ url })
-                        }
-                      }}
-                      className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white"
-                      placeholder="https://api.example.com/endpoint"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-2">Headers</label>
-                  <textarea 
-                    value={typeof selectedRequestData.headers === 'string' 
-                      ? selectedRequestData.headers 
-                      : JSON.stringify(selectedRequestData.headers || {}, null, 2)}
-                    onChange={(e) => {
-                      const value = e.target.value
-                      try {
-                        // Basic JSON validation to prevent injection
-                        if (value.trim() && (value.includes('{') || value.includes('['))) {
-                          const headers = JSON.parse(value)
-                          // Validate that headers is an object
-                          if (typeof headers === 'object' && headers !== null && !Array.isArray(headers)) {
-                            handleUpdateRequest({ headers })
-                          } else {
-                            handleUpdateRequest({ headers: value })
-                          }
-                        } else {
-                          handleUpdateRequest({ headers: value })
-                        }
-                      } catch {
-                        handleUpdateRequest({ headers: value })
-                      }
-                    }}
-                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white h-24 font-mono text-sm"
-                    placeholder="Enter headers as JSON format"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-2">Body</label>
-                  <textarea 
-                    value={selectedRequestData.body || ''}
-                    onChange={(e) => handleUpdateRequest({ body: e.target.value })}
-                    className="w-full bg-gray-800 border border-gray-700 rounded px-3 py-2 text-white h-32 font-mono text-sm"
-                  />
-                </div>
-                <div className="flex gap-4">
-                  <button className="bg-green-600 hover:bg-green-700 text-white py-2 px-6 rounded">
-                    Send Request
-                  </button>
-                  <button 
-                    onClick={handleDeleteRequest}
-                    className="bg-red-600 hover:bg-red-700 text-white py-2 px-6 rounded"
-                  >
-                    Delete
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="text-gray-400 text-center py-8">
-                Select a request to edit or create a new one
-              </div>
-            )}
+        {notice && (
+          <div
+            role="status"
+            className={`mb-4 rounded px-4 py-2 text-sm ${
+              notice.tone === 'error' ? 'bg-red-950 text-red-200' : 'bg-gray-900 text-gray-300'
+            }`}
+          >
+            {notice.text}
           </div>
+        )}
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+          <RequestList
+            requests={requests}
+            selectedId={selectedId}
+            peers={peers}
+            onSelect={handleSelectRequest}
+            onAdd={handleAddRequest}
+          />
+
+          {selectedRequest ? (
+            <RequestEditor
+              key={selectedRequest.id}
+              request={selectedRequest}
+              sending={sending}
+              canUndo={canUndo}
+              canRedo={canRedo}
+              onChange={applyPatch}
+              onSend={handleSend}
+              onDuplicate={handleDuplicateRequest}
+              onDelete={handleDeleteRequest}
+              onUndo={handleUndo}
+              onRedo={handleRedo}
+            />
+          ) : (
+            <div className="lg:col-span-2 bg-gray-900 rounded-lg p-4 flex items-center justify-center">
+              <p className="text-gray-400">Select a request to edit or create a new one</p>
+            </div>
+          )}
         </div>
 
-        <div className="mt-6 bg-gray-900 rounded-lg p-4">
-          <h2 className="text-xl font-semibold mb-4">Collaboration Status</h2>
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <div className={`w-3 h-3 rounded-full ${connectionStatus === 'connected' ? 'bg-green-500' : 'bg-red-500'}`}></div>
-              <span className="text-sm capitalize">{connectionStatus}</span>
-            </div>
-            <div className="text-sm text-gray-400">
-              Real-time sync enabled • Offline support active • {requests.length} requests
-            </div>
-          </div>
-        </div>
+        <ResponseViewer response={response} />
+
+        <PresenceBar
+          peers={peers}
+          status={status}
+          synced={synced}
+          requestCount={requests.length}
+        />
       </div>
     </div>
   )
