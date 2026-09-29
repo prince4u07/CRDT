@@ -14,9 +14,11 @@ Traditional API collaboration tools (like Postman's shared collections) have slo
 
 - **Frontend**: React + Vite + Tailwind CSS
 - **CRDT Engine**: Yjs (YATA algorithm implementation)
-- **Real-time Sync**: Custom WebSocket server
+- **Real-time Sync**: Custom stateful WebSocket server (`server.js`, `y-protocols`)
 - **Offline Storage**: IndexedDB via y-indexeddb
-- **Backend Persistence**: Convex
+- **Server Persistence**: Appended Yjs snapshots under `.yjs-data/`
+- **Backend Persistence**: Convex (shared document snapshots)
+- **Tests**: Vitest (119 unit/integration tests) + a real two-client E2E script
 - **Package Manager**: npm
 
 ## 🏗 Architecture
@@ -25,16 +27,26 @@ Traditional API collaboration tools (like Postman's shared collections) have slo
 ┌─────────────────┐     WebSocket     ┌──────────────────┐
 │   React UI      │ ◄──────────────► │  WebSocket Server │
 │                 │    (Yjs sync)     │  (Room-based)     │
-└────────┬────────┘                   └────────┬─────────┘
+└────────┬────────┘   + awareness      └────────┬─────────┘
          │                                      │
-         │                                      │
-         │ IndexedDB                            │
-         ▼                                      ▼
+         │                              debounced Yjs snapshots
+         │ IndexedDB                                │
+         ▼                                          ▼
 ┌─────────────────┐                   ┌──────────────────┐
-│  Offline Cache  │                   │   Convex Backend  │
-│  (y-indexeddb)  │                   │  (Persistence)   │
-└─────────────────┘                   └──────────────────┘
+│  Offline Cache  │                   │  .yjs-data/ room │
+│  (y-indexeddb)  │                   │      files       │
+└─────────────────┘                   └────────┬─────────┘
+                                                │
+                                                ▼
+                                       ┌──────────────────┐
+                                       │   Convex Backend  │
+                                       │ (room snapshots)  │
+                                       └──────────────────┘
 ```
+
+The browser restores from Convex only when it has nothing of its own **and** the
+first WebSocket sync has completed, so a stored snapshot can never be merged on
+top of live server state (which would resurrect deleted requests).
 
 ## 🔄 How It Works
 
@@ -66,6 +78,20 @@ Traditional API collaboration tools (like Postman's shared collections) have slo
    - Works without internet connection
    - When reconnecting, offline changes sync automatically
    - CRDT merge handles any conflicts from offline period
+
+6. **Presence**:
+   - Each client publishes its name, colour and the request it is editing
+   - The server drops the presence of a socket that disconnects, so a closed tab
+     disappears from the list instead of lingering
+   - On reconnect the client re-publishes its state with a **fresh awareness
+     clock**; without that bump every peer would discard the re-announcement as
+     stale and the collaborator would stay invisible until the next heartbeat
+
+7. **Request execution**:
+   - Sending a request runs a browser `fetch` (the browser enforces CORS)
+   - Method, headers and body are validated before the request leaves the app
+   - The response status, headers and body are rendered in a response viewer
+   - There is no server-side proxy, so no SSRF surface is introduced
 
 ### Data Flow Example
 
@@ -102,7 +128,7 @@ npm install
 # Start WebSocket server (for real-time sync)
 npm run server
 
-# Start Convex backend (for persistence)
+# Start Convex backend (optional; needed to restore/save shared snapshots)
 npx convex dev
 
 # Start frontend development server
@@ -111,6 +137,32 @@ npm run dev
 
 The app will be available at http://localhost:5173
 
+### Environment
+
+Copy `.env.example` to `.env.local` and adjust as needed:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `VITE_WS_URL` | WebSocket sync server | `ws://localhost:1234` |
+| `VITE_CONVEX_URL` | Convex deployment URL | unset (Convex disabled) |
+
+The app runs without Convex: the WebSocket server is the source of truth and
+keeps its own snapshots in `.yjs-data/`.
+
+## 🧪 Tests
+
+```bash
+npm test           # Vitest: CRDT service, HTTP client, App integration
+npm run test:e2e   # spawns the real server + two Yjs clients
+npm run lint
+npm run build
+```
+
+`npm run test:e2e` boots `server.js` on a free port and verifies edit
+replication, awareness (including a dropped and returning client), concurrent
+offline merges, late-joiner sync, room isolation, restart persistence and
+malformed-message handling.
+
 ## 🎮 Usage
 
 1. **Open the app**: Navigate to http://localhost:5173
@@ -118,6 +170,8 @@ The app will be available at http://localhost:5173
 3. **Edit requests**: Click any request to edit name, method, URL, headers, body
 4. **Collaborate**: Open the app in multiple browser windows to see real-time sync
 5. **Test offline**: Disconnect internet - edits continue working and sync when reconnected
+6. **Send a request**: Choose "Send" to execute it and inspect the response
+7. **Move data**: Export/import the collection as a Yjs binary document
 
 ## 🔑 Key Features
 
@@ -125,8 +179,22 @@ The app will be available at http://localhost:5173
 - **Real-time Sync**: Changes propagate instantly across all connected clients
 - **Offline-First**: Works without internet, syncs automatically when reconnected
 - **Room-Based**: Different collections can be edited independently
-- **Persistent**: Convex backend stores document snapshots and history
+- **Presence**: See who is online and which request each person is editing
+- **Durable**: The server keeps per-room snapshots on disk; Convex keeps shared ones
+- **Import / Export**: Move a whole collection as a Yjs binary document
+- **Request Execution**: Send a request and inspect status, headers and body
 - **Fast**: Yjs is 10-50x faster than alternatives like Automerge
+
+## ⚠️ Known Limitations
+
+- **No authentication or authorization**: every client that knows a collection id
+  can read and edit that collection, and the local identity is not verified
+- **No server-side request proxy**: requests run in the browser, so cross-origin
+  targets need permissive CORS headers
+- **Convex is snapshot-based**: a client only restores a stored snapshot when it
+  has no local content of its own, which means two brand-new browsers joining an
+  empty-looking collection can each bootstrap independently
+- **Awareness is ephemeral**: presence is intentionally not persisted
 
 ## 🧠 Technical Deep Dive
 
@@ -165,16 +233,27 @@ The project uses Yjs's shared types:
 
 ```
 CRDT/
-├── convex/              # Convex backend
-│   ├── schema.ts        # Database schema
-│   └── collections.ts   # Backend functions
+├── convex/                 # Convex backend
+│   ├── schema.ts           # Database schema
+│   └── collections.ts      # Backend functions
 ├── src/
+│   ├── components/
+│   │   ├── PresenceBar.jsx     # Connection state and online users
+│   │   ├── RequestEditor.jsx   # Name/method/URL/headers/body, undo, send
+│   │   ├── RequestList.jsx     # Request list with presence indicators
+│   │   └── ResponseViewer.jsx  # Response status, headers and body
 │   ├── lib/
-│   │   └── crdtService.js  # Yjs CRDT operations
-│   ├── App.jsx          # Main React component
-│   ├── main.jsx         # React entry point
-│   └── index.css        # Tailwind styles
-├── server.js            # WebSocket sync server
+│   │   ├── convexService.js    # Convex HTTP client + snapshot encoding
+│   │   ├── crdtService.js      # Yjs document, persistence, sync, presence
+│   │   └── httpClient.js       # Browser request execution
+│   ├── test/                    # Vitest suites (crdtService, httpClient,
+│   │                            #   convexService, App integration)
+│   ├── App.jsx                 # Lifecycle, bootstrap, cache controls
+│   ├── main.jsx                # React entry point
+│   └── index.css               # Tailwind styles
+├── scripts/
+│   └── sync-e2e.mjs         # Two-client E2E against the real server
+├── server.js                # WebSocket sync server
 ├── package.json
 ├── vite.config.js
 └── tailwind.config.js
@@ -188,12 +267,12 @@ CRDT/
 
 ## 🔮 Future Enhancements
 
-- User authentication and presence awareness
+- User authentication and per-collection authorization
 - Request history and time-travel debugging
 - Multiple collections per workspace
 - Import/export from Postman collections
-- Request execution and response viewer
 - Environment variables support
+- A server-side proxy with an allowlist for cross-origin requests
 
 ## 📄 License
 
