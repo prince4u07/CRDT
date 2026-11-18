@@ -8,7 +8,7 @@ Traditional API collaboration tools (like Postman's shared collections) have slo
 
 ## 🚀 What Makes This Special
 
-**DSA Achievement**: Implements a genuine CRDT - an advanced data structure rarely seen in student projects. Used in production by Google Docs, Figma, and Redis. The YATA algorithm guarantees mathematical convergence regardless of update order.
+**Data Structures and Algorithms (DSA) Achievement**: Implements a genuine CRDT - an advanced data structure rarely seen in student projects. Used in production by Google Docs, Figma, and Redis. The YATA algorithm guarantees mathematical convergence regardless of update order.
 
 ## 🛠 Tech Stack
 
